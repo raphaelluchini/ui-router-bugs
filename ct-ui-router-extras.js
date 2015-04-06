@@ -1,13 +1,31 @@
 /**
+
  * UI-Router Extras: Sticky states, Future States, Deep State Redirect, Transition promise
- * @version v0.0.12-pre1
+ * Monolithic build (all modules)
+ * @version 0.0.13
  * @link http://christopherthielen.github.io/ui-router-extras/
  * @license MIT License, http://www.opensource.org/licenses/MIT
  */
+(function(angular, undefined){
+"use strict";
+var mod_core = angular.module("ct.ui.router.extras.core", [ "ui.router" ]);
 
-(function (window, angular, undefined) {
-angular.module("ct.ui.router.extras", [ 'ui.router' ]);
+var internalStates = {}, stateRegisteredCallbacks = [];
+mod_core.config([ '$stateProvider', '$injector', function ($stateProvider, $injector) {
+  // Decorate any state attribute in order to get access to the internal state representation.
+  $stateProvider.decorator('parent', function (state, parentFn) {
+    // Capture each internal UI-Router state representations as opposed to the user-defined state object.
+    // The internal state is, e.g., the state returned by $state.$current as opposed to $state.current
+    internalStates[state.self.name] = state;
+    // Add an accessor for the internal state from the user defined state
+    state.self.$$state = function () {
+      return internalStates[state.self.name];
+    };
 
+    angular.forEach(stateRegisteredCallbacks, function(callback) { callback(state); });
+    return parentFn(state);
+  });
+}]);
 
 var DEBUG = false;
 
@@ -132,6 +150,35 @@ function inherit(parent, extra) {
   return extend(new (extend(function () { }, {prototype: parent}))(), extra);
 }
 
+function onStateRegistered(callback) { stateRegisteredCallbacks.push(callback); }
+
+mod_core.provider("uirextras_core", function() {
+  var core = {
+    internalStates: internalStates,
+    onStateRegistered: onStateRegistered,
+    forEach: forEach,
+    extend: extend,
+    isArray: isArray,
+    map: map,
+    keys: keys,
+    filter: filter,
+    filterObj: filterObj,
+    ancestors: ancestors,
+    objectKeys: objectKeys,
+    protoKeys: protoKeys,
+    arraySearch: arraySearch,
+    inheritParams: inheritParams,
+    inherit: inherit
+  };
+
+  angular.extend(this, core);
+
+  this.$get = function() {
+    return core;
+  };
+});
+
+
 var ignoreDsr;
 function resetIgnoreDsr() {
   ignoreDsr = undefined;
@@ -139,7 +186,7 @@ function resetIgnoreDsr() {
 
 // Decorate $state.transitionTo to gain access to the last transition.options variable.
 // This is used to process the options.ignoreDsr option
-angular.module("ct.ui.router.extras").config([ "$provide", function ($provide) {
+angular.module('ct.ui.router.extras.dsr', [ 'ct.ui.router.extras.core' ]).config([ "$provide", function ($provide) {
   var $state_transitionTo;
   $provide.decorator("$state", ['$delegate', '$q', function ($state, $q) {
     $state_transitionTo = $state.transitionTo;
@@ -163,7 +210,7 @@ angular.module("ct.ui.router.extras").config([ "$provide", function ($provide) {
   }]);
 }]);
 
-angular.module("ct.ui.router.extras").service("$deepStateRedirect", [ '$rootScope', '$state', '$injector', function ($rootScope, $state, $injector) {
+angular.module('ct.ui.router.extras.dsr').service("$deepStateRedirect", [ '$rootScope', '$state', '$injector', function ($rootScope, $state, $injector) {
   var lastSubstate = {};
   var deepStateRedirectsByName = {};
 
@@ -177,14 +224,19 @@ angular.module("ct.ui.router.extras").service("$deepStateRedirect", [ '$rootScop
   }
 
   function getConfig(state) {
-    var declaration = state.deepStateRedirect;
+    var declaration = state.deepStateRedirect || state.dsr;
     if (!declaration) return { dsr: false };
     var dsrCfg = { dsr: true };
 
-    if (angular.isFunction(declaration))
+    if (angular.isFunction(declaration)) {
       dsrCfg.fn = declaration;
-    else if (angular.isObject(declaration))
+    } else if (angular.isObject(declaration)) {
       dsrCfg = angular.extend(dsrCfg, declaration);
+    }
+
+    if (angular.isString(dsrCfg.default)) {
+      dsrCfg.default = { state: dsrCfg.default };
+    }
 
     if (!dsrCfg.fn) {
       dsrCfg.fn = [ '$dsr$', function($dsr$) {
@@ -214,23 +266,30 @@ angular.module("ct.ui.router.extras").service("$deepStateRedirect", [ '$rootScop
     return deepStateRedirectsByName[state.name] || false;
   }
 
-  function getParamsString(params, dsrParams) {
-    function safeString(input) { return !input ? input : input.toString(); }
+  function getMatchParams(params, dsrParams) {
     if (dsrParams === true) dsrParams = Object.keys(params);
     if (dsrParams === null || dsrParams === undefined) dsrParams = [];
 
+    var matchParams = {};
+    angular.forEach(dsrParams.sort(), function(name) { matchParams[name] = params[name]; });
+    return matchParams;
+  }
+
+  function getParamsString(params, dsrParams) {
+    var matchParams = getMatchParams(params, dsrParams);
+    function safeString(input) { return !input ? input : input.toString(); }
     var paramsToString = {};
-    angular.forEach(dsrParams.sort(), function(name) { paramsToString[name] = safeString(params[name]); });
+    angular.forEach(matchParams, function(val, name) { paramsToString[name] = safeString(val); });
     return angular.toJson(paramsToString);
   }
 
   $rootScope.$on("$stateChangeStart", function (event, toState, toParams, fromState, fromParams) {
-    if (ignoreDsr || computeDeepStateStatus(toState) !== REDIRECT) return;
+    var cfg = getConfig(toState);
+    if (ignoreDsr || (computeDeepStateStatus(toState) !== REDIRECT) && !cfg.default) return;
     // We're changing directly to one of the redirect (tab) states.
     // Get the DSR key for this state by calculating the DSRParams option
-    var cfg = getConfig(toState);
     var key = getParamsString(toParams, cfg.params);
-    var redirect = lastSubstate[toState.name][key];
+    var redirect = lastSubstate[toState.name][key] || cfg.default;
     if (!redirect) return;
 
     // we have a last substate recorded
@@ -239,7 +298,8 @@ angular.module("ct.ui.router.extras").service("$deepStateRedirect", [ '$rootScop
     if (!result) return;
     if (result.state) redirect = result;
     event.preventDefault();
-    $state.go(redirect.state, redirect.params);
+    var redirectParams = getMatchParams(toParams, cfg.params);
+    $state.go(redirect.state, angular.extend(redirectParams, redirect.params));
   });
 
   $rootScope.$on("$stateChangeSuccess", function (event, toState, toParams, fromState, fromParams) {
@@ -277,16 +337,26 @@ angular.module("ct.ui.router.extras").service("$deepStateRedirect", [ '$rootScop
   };
 }]);
 
-angular.module("ct.ui.router.extras").run(['$deepStateRedirect', function ($deepStateRedirect) {
+angular.module('ct.ui.router.extras.dsr').run(['$deepStateRedirect', function ($deepStateRedirect) {
   // Make sure $deepStateRedirect is instantiated
 }]);
 
-$StickyStateProvider.$inject = [ '$stateProvider' ];
-function $StickyStateProvider($stateProvider) {
+angular.module("ct.ui.router.extras.sticky", [ 'ct.ui.router.extras.core' ]);
+
+var mod_sticky = angular.module("ct.ui.router.extras.sticky");
+
+$StickyStateProvider.$inject = [ '$stateProvider', 'uirextras_coreProvider' ];
+function $StickyStateProvider($stateProvider, uirextras_coreProvider) {
+  var core = uirextras_coreProvider;
+  var inheritParams = core.inheritParams;
+  var protoKeys = core.protoKeys;
+  var map = core.map;
+
   // Holds all the states which are inactivated.  Inactivated states can be either sticky states, or descendants of sticky states.
   var inactiveStates = {}; // state.name -> (state)
   var stickyStates = {}; // state.name -> true
   var $state;
+  var DEBUG = false;
 
   // Called by $stateProvider.registerState();
   // registers a sticky state with $stickyStateProvider
@@ -295,8 +365,10 @@ function $StickyStateProvider($stateProvider) {
     // console.log("Registered sticky state: ", state);
   };
 
-  this.enableDebug = function (enabled) {
-    DEBUG = enabled;
+  this.enableDebug = this.debugMode = function (enabled) {
+    if (angular.isDefined(enabled))
+      DEBUG = enabled;
+    return DEBUG;
   };
 
   this.$get = [  '$rootScope', '$state', '$stateParams', '$injector', '$log',
@@ -351,10 +423,11 @@ function $StickyStateProvider($stateProvider) {
       // it as a Exit/Enter, thus the special "updateStateParams" transition.
       // If a parent inactivated state has "updateStateParams" transition type, then
       // all descendant states must also be exit/entered, thus the first line of this function.
-      function getEnterTransition(state, stateParams, ancestorParamsChanged) {
+      function getEnterTransition(state, stateParams, reloadStateTree, ancestorParamsChanged) {
         if (ancestorParamsChanged) return "updateStateParams";
         var inactiveState = inactiveStates[state.self.name];
         if (!inactiveState) return "enter";
+        if (state.self === reloadStateTree) return "updateStateParams";
 //      if (inactiveState.locals == null || inactiveState.locals.globals == null) debugger;
         var paramsMatch = equalForKeys(stateParams, inactiveState.locals.globals.$stateParams, state.ownParams);
 //      if (DEBUG) $log.debug("getEnterTransition: " + state.name + (paramsMatch ? ": reactivate" : ": updateStateParams"));
@@ -372,8 +445,8 @@ function $StickyStateProvider($stateProvider) {
 
       // Duplicates logic in $state.transitionTo, primarily to find the pivot state (i.e., the "keep" value)
       function equalForKeys(a, b, keys) {
-        if (angular.isObject(keys)) {
-          keys = protoKeys(keys, ["$$keys", "$$values", "$$equals", "$$validates"]);
+        if (!angular.isArray(keys) && angular.isObject(keys)) {
+          keys = protoKeys(keys, ["$$keys", "$$values", "$$equals", "$$validates", "$$new", "$$parent"]);
         }
         if (!keys) {
           keys = [];
@@ -412,6 +485,7 @@ function $StickyStateProvider($stateProvider) {
             fromParams = transition.fromParams,
             toPath = transition.toState.path,
             toParams = transition.toParams,
+            reloadStateTree = transition.reloadStateTree,
             options = transition.options;
           var keep = 0, state = toPath[keep];
 
@@ -420,13 +494,14 @@ function $StickyStateProvider($stateProvider) {
           }
 
           while (state && state === fromPath[keep] && equalForKeys(toParams, fromParams, state.ownParams)) {
+            // We're "keeping" this state. bump keep var and get the next state in toPath for the next iteration.
             state = toPath[++keep];
           }
 
           result.keep = keep;
 
-          var idx, deepestUpdatedParams, deepestReactivate, reactivatedStatesByName = {}, pType = getStickyTransitionType(fromPath, toPath, keep);
-          var ancestorUpdated = false; // When ancestor params change, treat reactivation as exit/enter
+          var idx, deepestUpdatedParams, deepestReactivate, noLongerInactiveStates = {}, pType = getStickyTransitionType(fromPath, toPath, keep);
+          var ancestorUpdated = !!options.reload; // When ancestor params change, treat reactivation as exit/enter
 
           // Calculate the "enter" transitions for new states in toPath
           // Enter transitions will be either "enter", "reactivate", or "updateStateParams" where
@@ -434,14 +509,14 @@ function $StickyStateProvider($stateProvider) {
           //   reactivate: use previous locals
           //   updateStateParams: like 'enter', except exit the inactive state before entering it.
           for (idx = keep; idx < toPath.length; idx++) {
-            var enterTrans = !pType.to ? "enter" : getEnterTransition(toPath[idx], transition.toParams, ancestorUpdated);
+            var enterTrans = !pType.to ? "enter" : getEnterTransition(toPath[idx], toParams, reloadStateTree, ancestorUpdated);
             ancestorUpdated = (ancestorUpdated || enterTrans == 'updateStateParams');
             result.enter[idx] = enterTrans;
             // If we're reactivating a state, make a note of it, so we can remove that state from the "inactive" list
             if (enterTrans == 'reactivate')
-              deepestReactivate = reactivatedStatesByName[toPath[idx].name] = toPath[idx];
+              deepestReactivate = noLongerInactiveStates[toPath[idx].name] = toPath[idx];
             if (enterTrans == 'updateStateParams')
-              deepestUpdatedParams = toPath[idx];
+              deepestUpdatedParams = noLongerInactiveStates[toPath[idx].name] = toPath[idx];
           }
           deepestReactivate = deepestReactivate ? deepestReactivate.self.name + "." : "";
           deepestUpdatedParams = deepestUpdatedParams ? deepestUpdatedParams.self.name + "." : "";
@@ -460,7 +535,7 @@ function $StickyStateProvider($stateProvider) {
             for (var i = 0; inactiveChildren && i < inactiveChildren.length; i++) {
               var child = inactiveChildren[i];
               // Don't organize state as inactive if we're about to reactivate it.
-              if (!reactivatedStatesByName[child.name] &&
+              if (!noLongerInactiveStates[child.name] &&
                 (!deepestReactivate || (child.self.name.indexOf(deepestReactivate) !== 0)) &&
                 (!deepestUpdatedParams || (child.self.name.indexOf(deepestUpdatedParams) !== 0)))
                 result.inactives.push(child);
@@ -539,9 +614,9 @@ function $StickyStateProvider($stateProvider) {
         },
 
         // Removes a previously inactivated state from the inactive sticky state registry
-        stateEntering: function (entering, params, onEnter) {
+        stateEntering: function (entering, params, onEnter, updateParams) {
           var inactivatedState = getInactivatedState(entering);
-          if (inactivatedState && !getInactivatedState(entering, params)) {
+          if (inactivatedState && (updateParams || !getInactivatedState(entering, params))) {
             var savedLocals = entering.locals;
             this.stateExiting(inactivatedState);
             entering.locals = savedLocals;
@@ -565,7 +640,7 @@ function $StickyStateProvider($stateProvider) {
     }];
 }
 
-angular.module("ct.ui.router.extras").provider("$stickyState", $StickyStateProvider);
+mod_sticky.provider("$stickyState", $StickyStateProvider);
 
 /**
  * Sticky States makes entire state trees "sticky". Sticky state trees are retained until their parent state is
@@ -652,13 +727,20 @@ function SurrogateState(type) {
 
 // ------------------------ Sticky State registration and initialization code ----------------------------------
 // Grab a copy of the $stickyState service for use by the transition management code
-angular.module("ct.ui.router.extras").run(["$stickyState", function ($stickyState) {
+angular.module("ct.ui.router.extras.sticky").run(["$stickyState", function ($stickyState) {
   _StickyState = $stickyState;
 }]);
 
-angular.module("ct.ui.router.extras").config(
-  [ "$provide", "$stateProvider", '$stickyStateProvider', '$urlMatcherFactoryProvider',
-    function ($provide, $stateProvider, $stickyStateProvider, $urlMatcherFactoryProvider) {
+angular.module("ct.ui.router.extras.sticky").config(
+  [ "$provide", "$stateProvider", '$stickyStateProvider', '$urlMatcherFactoryProvider', 'uirextras_coreProvider',
+    function ($provide, $stateProvider, $stickyStateProvider, $urlMatcherFactoryProvider, uirextras_coreProvider) {
+      var core = uirextras_coreProvider;
+      var internalStates = core.internalStates;
+      var inherit = core.inherit;
+      var inheritParams = core.inheritParams;
+      var map = core.map;
+      var filterObj = core.filterObj;
+
       versionHeuristics.hasParamSet = !!$urlMatcherFactoryProvider.ParamSet;
       // inactivePseudoState (__inactives) holds all the inactive locals which includes resolved states data, i.e., views, scope, etc
       inactivePseudoState = angular.extend(new SurrogateState("__inactives"), { self: {  name: '__inactives'  } });
@@ -666,22 +748,11 @@ angular.module("ct.ui.router.extras").config(
       root = pendingRestore = undefined;
       pendingTransitions = [];
 
-      // Decorate any state attribute in order to get access to the internal state representation.
-      $stateProvider.decorator('parent', function (state, parentFn) {
-        // Capture each internal UI-Router state representations as opposed to the user-defined state object.
-        // The internal state is, e.g., the state returned by $state.$current as opposed to $state.current
-        internalStates[state.self.name] = state;
-        // Add an accessor for the internal state from the user defined state
-        state.self.$$state = function () {
-          return internalStates[state.self.name];
-        };
-
+      uirextras_coreProvider.onStateRegistered(function(state) {
         // Register the ones marked as "sticky"
         if (state.self.sticky === true) {
           $stickyStateProvider.registerStickyState(state.self);
         }
-
-        return parentFn(state);
       });
 
       var $state_transitionTo; // internal reference to the real $state.transitionTo function
@@ -700,6 +771,7 @@ angular.module("ct.ui.router.extras").config(
 
         // ------------------------ Decorated transitionTo implementation begins here ---------------------------
         $state.transitionTo = function (to, toParams, options) {
+          var DEBUG = $stickyStateProvider.debugMode();
           // TODO: Move this to module.run?
           // TODO: I'd rather have root.locals prototypally inherit from inactivePseudoState.locals
           // Link root.locals and inactives.locals.  Do this at runtime, after root.locals has been set.
@@ -718,6 +790,8 @@ angular.module("ct.ui.router.extras").config(
           var toStateSelf = $state.get(to, rel); // exposes findState relative path functionality, returns state.self
           var savedToStatePath, savedFromStatePath, stickyTransitions;
           var reactivated = [], exited = [], terminalReactivatedState;
+          toParams = toParams || {};
+          arguments[1] = toParams;
 
           var noop = function () {
           };
@@ -812,6 +886,19 @@ angular.module("ct.ui.router.extras").config(
             return state;
           }
 
+          // TODO: This may be completely unnecessary now that we're using $$uirouterextrasreload temp param
+          function stateUpdateParamsSurrogate(state, toParams) {
+            var oldOnEnter = state.self.onEnter;
+            state.self.onEnter = function () {
+              _StickyState.stateEntering(state, toParams, oldOnEnter, true);
+            };
+            restore.addRestoreFunction(function () {
+              state.self.onEnter = oldOnEnter;
+            });
+
+            return state;
+          }
+
           function stateExitedSurrogate(state) {
             var oldOnExit = state.self.onExit;
             state.self.onExit = function () {
@@ -833,10 +920,50 @@ angular.module("ct.ui.router.extras").config(
               savedToStatePath = toState.path;
               savedFromStatePath = fromState.path;
 
-              var currentTransition = {toState: toState, toParams: toParams || {}, fromState: fromState, fromParams: fromParams || {}, options: options};
+              // Try to resolve options.reload to a state.  If so, we'll reload only up to the given state.
+              var reload = options && options.reload || false;
+              var reloadStateTree = reload && (reload === true ? savedToStatePath[0].self : $state.get(reload, rel));
+              // If options.reload is a string or a state, we want to handle reload ourselves and not
+              // let ui-router reload the entire toPath.
+              if (options && reload && reload !== true)
+                delete options.reload;
+
+              var currentTransition = {
+                toState: toState,
+                toParams: toParams || {},
+                fromState: fromState,
+                fromParams: fromParams || {},
+                options: options,
+                reloadStateTree: reloadStateTree
+              };
 
               pendingTransitions.push(currentTransition); // TODO: See if a list of pending transitions is necessary.
               pendingRestore = restore;
+
+              // If we're reloading from a state and below, temporarily add a param to the top of the state tree
+              // being reloaded, and add a param value to the transition.  This will cause the "has params changed
+              // for state" check to return false, and the states will be reloaded.
+              if (reloadStateTree) {
+                currentTransition.toParams.$$uirouterextrasreload = Math.random();
+                var params = reloadStateTree.$$state().params;
+                var ownParams = reloadStateTree.$$state().ownParams;
+
+                if (versionHeuristics.hasParamSet) {
+                  var tempParam = new $urlMatcherFactoryProvider.Param('$$uirouterextrasreload');
+                  params.$$uirouterextrasreload = ownParams.$$uirouterextrasreload = tempParam;
+                  restore.restoreFunctions.push(function() {
+                    delete params.$$uirouterextrasreload;
+                    delete ownParams.$$uirouterextrasreload;
+                  });
+                } else {
+                  params.push('$$uirouterextrasreload');
+                  ownParams.push('$$uirouterextrasreload');
+                  restore.restoreFunctions.push(function() {
+                    params.length = params.length -1;
+                    ownParams.length = ownParams.length -1;
+                  });
+                }
+              }
 
               // $StickyStateProvider.processTransition analyzes the states involved in the pending transition.  It
               // returns an object that tells us:
@@ -873,26 +1000,27 @@ angular.module("ct.ui.router.extras").config(
               // Depending on the entered-state transition type, place the proper surrogate state on the surrogate toPath.
               angular.forEach(stickyTransitions.enter, function (value, idx) {
                 var surrogate;
+                var enteringState = toState.path[idx];
                 if (value === "reactivate") {
                   // Reactivated states require TWO surrogates.  The "phase 1 reactivated surrogates" are added to both
                   // to.path and from.path, and as such, are considered to be "kept" by UI-Router.
                   // This is required to get UI-Router to add the surrogate locals to the protoypal locals object
-                  surrogate = stateReactivatedSurrogatePhase1(toState.path[idx]);
+                  surrogate = stateReactivatedSurrogatePhase1(enteringState);
                   surrogateToPath.push(surrogate);
                   surrogateFromPath.push(surrogate);  // so toPath[i] === fromPath[i]
 
                   // The "phase 2 reactivated surrogate" is added to the END of the .path, after all the phase 1
                   // surrogates have been added.
-                  reactivated.push(stateReactivatedSurrogatePhase2(toState.path[idx]));
-                  terminalReactivatedState = surrogate;
+                  reactivated.push(stateReactivatedSurrogatePhase2(enteringState));
+                  terminalReactivatedState = enteringState;
                 } else if (value === "updateStateParams") {
                   // If the state params have been changed, we need to exit any inactive states and re-enter them.
-                  surrogate = stateEnteredSurrogate(toState.path[idx]);
+                  surrogate = stateUpdateParamsSurrogate(enteringState);
                   surrogateToPath.push(surrogate);
-                  terminalReactivatedState = surrogate;
+                  terminalReactivatedState = enteringState;
                 } else if (value === "enter") {
                   // Standard enter transition.  We still wrap it in a surrogate.
-                  surrogateToPath.push(stateEnteredSurrogate(toState.path[idx]));
+                  surrogateToPath.push(stateEnteredSurrogate(enteringState));
                 }
               });
 
@@ -917,9 +1045,9 @@ angular.module("ct.ui.router.extras").config(
                 });
               }
 
-              // In some cases, we may be some state, but not its children states.  If that's the case, we have to
-              // exit all the children of the deepest reactivated state.
-              if (terminalReactivatedState) {
+              // We may transition directly to an inactivated state, reactivating it.  In this case, we should
+              // exit all of that state's inactivated children.
+              if (toState === terminalReactivatedState) {
                 var prefix = terminalReactivatedState.self.name + ".";
                 var inactiveStates = _StickyState.getInactiveStates();
                 var inactiveOrphans = [];
@@ -975,371 +1103,396 @@ angular.module("ct.ui.router.extras").config(
         };
         return $state;
       }]);
+
+
+
+      function debugTransition($log, currentTransition, stickyTransition) {
+        function message(path, index, state) {
+          return (path[index] ? path[index].toUpperCase() + ": " + state.self.name : "(" + state.self.name + ")");
+        }
+
+        var inactiveLogVar = map(stickyTransition.inactives, function (state) {
+          return state.self.name;
+        });
+        var enterLogVar = map(currentTransition.toState.path, function (state, index) {
+          return message(stickyTransition.enter, index, state);
+        });
+        var exitLogVar = map(currentTransition.fromState.path, function (state, index) {
+          return message(stickyTransition.exit, index, state);
+        });
+
+        var transitionMessage = currentTransition.fromState.self.name + ": " +
+          angular.toJson(currentTransition.fromParams) + ": " +
+          " -> " +
+          currentTransition.toState.self.name + ": " +
+          angular.toJson(currentTransition.toParams);
+
+        $log.debug("   Current transition: ", transitionMessage);
+        $log.debug("Before transition, inactives are:   : ", map(_StickyState.getInactiveStates(), function (s) {
+          return s.self.name;
+        }));
+        $log.debug("After transition,  inactives will be: ", inactiveLogVar);
+        $log.debug("Transition will exit:  ", exitLogVar);
+        $log.debug("Transition will enter: ", enterLogVar);
+      }
+
+      function debugViewsAfterSuccess($log, currentState, $state) {
+        $log.debug("Current state: " + currentState.self.name + ", inactive states: ", map(_StickyState.getInactiveStates(), function (s) {
+          return s.self.name;
+        }));
+
+        var viewMsg = function (local, name) {
+          return "'" + name + "' (" + local.$$state.name + ")";
+        };
+        var statesOnly = function (local, name) {
+          return name != 'globals' && name != 'resolve';
+        };
+        var viewsForState = function (state) {
+          var views = map(filterObj(state.locals, statesOnly), viewMsg).join(", ");
+          return "(" + (state.self.name ? state.self.name : "root") + ".locals" + (views.length ? ": " + views : "") + ")";
+        };
+
+        var message = viewsForState(currentState);
+        var parent = currentState.parent;
+        while (parent && parent !== currentState) {
+          if (parent.self.name === "") {
+            // Show the __inactives before showing root state.
+            message = viewsForState($state.$current.path[0]) + " / " + message;
+          }
+          message = viewsForState(parent) + " / " + message;
+          currentState = parent;
+          parent = currentState.parent;
+        }
+
+        $log.debug("Views: " + message);
+      }
+
+
+
     }
   ]
 );
 
-function debugTransition($log, currentTransition, stickyTransition) {
-  function message(path, index, state) {
-    return (path[index] ? path[index].toUpperCase() + ": " + state.self.name : "(" + state.self.name + ")");
-  }
+(function(angular, undefined) {
+  var app = angular.module('ct.ui.router.extras.future', [ 'ct.ui.router.extras.core' ]);
 
-  var inactiveLogVar = map(stickyTransition.inactives, function (state) {
-    return state.self.name;
-  });
-  var enterLogVar = map(currentTransition.toState.path, function (state, index) {
-    return message(stickyTransition.enter, index, state);
-  });
-  var exitLogVar = map(currentTransition.fromState.path, function (state, index) {
-    return message(stickyTransition.exit, index, state);
-  });
+  _futureStateProvider.$inject = [ '$stateProvider', '$urlRouterProvider', '$urlMatcherFactoryProvider', 'uirextras_coreProvider' ];
+  function _futureStateProvider($stateProvider, $urlRouterProvider, $urlMatcherFactory, uirextras_coreProvider) {
+    var core = uirextras_coreProvider;
+    var internalStates = core.internalStates;
+    var stateFactories = {}, futureStates = {};
+    var lazyloadInProgress = false, resolveFunctions = [], initPromise, initDone = false;
+    var provider = this;
 
-  var transitionMessage = currentTransition.fromState.self.name + ": " +
-    angular.toJson(currentTransition.fromParams) + ": " +
-    " -> " +
-    currentTransition.toState.self.name + ": " +
-    angular.toJson(currentTransition.toParams);
+    // This function registers a promiseFn, to be resolved before the url/state matching code
+    // will reject a route.  The promiseFn is injected/executed using the runtime $injector.
+    // The function should return a promise.
+    // When all registered promises are resolved, then the route is re-sync'ed.
 
-  $log.debug("   Current transition: ", transitionMessage);
-  $log.debug("Before transition, inactives are:   : ", map(_StickyState.getInactiveStates(), function (s) {
-    return s.self.name;
-  }));
-  $log.debug("After transition,  inactives will be: ", inactiveLogVar);
-  $log.debug("Transition will exit:  ", exitLogVar);
-  $log.debug("Transition will enter: ", enterLogVar);
-}
+    // Example: function($http) {
+    //  return $http.get('//server.com/api/DynamicFutureStates').then(function(data) {
+    //    angular.forEach(data.futureStates, function(fstate) { $futureStateProvider.futureState(fstate); });
+    //  };
+    // }
+    this.addResolve = function (promiseFn) {
+      resolveFunctions.push(promiseFn);
+    };
 
-function debugViewsAfterSuccess($log, currentState, $state) {
-  $log.debug("Current state: " + currentState.self.name + ", inactive states: ", map(_StickyState.getInactiveStates(), function (s) {
-    return s.self.name;
-  }));
+    // Register a state factory function for a particular future-state type.  This factory, given a future-state object,
+    // should create a ui-router state.
+    // The factory function is injected/executed using the runtime $injector.  The future-state is injected as 'futureState'.
 
-  var viewMsg = function (local, name) {
-    return "'" + name + "' (" + local.$$state.name + ")";
-  };
-  var statesOnly = function (local, name) {
-    return name != 'globals' && name != 'resolve';
-  };
-  var viewsForState = function (state) {
-    var views = map(filterObj(state.locals, statesOnly), viewMsg).join(", ");
-    return "(" + (state.self.name ? state.self.name : "root") + ".locals" + (views.length ? ": " + views : "") + ")";
-  };
+    // Example:
+    //    $futureStateProvider.stateFactory('test', function(futureState) {
+    //      return {
+    //        name: futureState.stateName,
+    //        url: futureState.urlFragment,
+    //        template: '<h3>Future State Template</h3>',
+    //        controller: function() {
+    //          console.log("Entered state " + futureState.stateName);
+    //        }
+    //      }
+    //    });
+    this.stateFactory = function (futureStateType, factory) {
+      stateFactories[futureStateType] = factory;
+    };
 
-  var message = viewsForState(currentState);
-  var parent = currentState.parent;
-  while (parent && parent !== currentState) {
-    if (parent.self.name === "") {
-      // Show the __inactives before showing root state.
-      message = viewsForState($state.$current.path[0]) + " / " + message;
-    }
-    message = viewsForState(parent) + " / " + message;
-    currentState = parent;
-    parent = currentState.parent;
-  }
+    this.futureState = function (futureState) {
+      if (futureState.stateName)  // backwards compat for now
+        futureState.name = futureState.stateName;
+      if (futureState.urlPrefix)  // backwards compat for now
+        futureState.url = "^" + futureState.urlPrefix;
 
-  $log.debug("Views: " + message);
-}
-
-
-angular.module('ct.ui.router.extras').provider('$futureState',
-  [ '$stateProvider', '$urlRouterProvider', '$urlMatcherFactoryProvider',
-    function _futureStateProvider($stateProvider, $urlRouterProvider, $urlMatcherFactory) {
-      var stateFactories = {}, futureStates = {};
-      var lazyloadInProgress = false, resolveFunctions = [], initPromise, initDone = false;
-      var provider = this;
-
-      // This function registers a promiseFn, to be resolved before the url/state matching code
-      // will reject a route.  The promiseFn is injected/executed using the runtime $injector.
-      // The function should return a promise.
-      // When all registered promises are resolved, then the route is re-sync'ed.
-
-      // Example: function($http) {
-      //  return $http.get('//server.com/api/DynamicFutureStates').then(function(data) {
-      //    angular.forEach(data.futureStates, function(fstate) { $futureStateProvider.futureState(fstate); });
-      //  };
-      // }
-      this.addResolve = function (promiseFn) {
-        resolveFunctions.push(promiseFn);
-      };
-
-      // Register a state factory function for a particular future-state type.  This factory, given a future-state object,
-      // should create a ui-router state.
-      // The factory function is injected/executed using the runtime $injector.  The future-state is injected as 'futureState'.
-
-      // Example:
-      //    $futureStateProvider.stateFactory('test', function(futureState) {
-      //      return {
-      //        name: futureState.stateName,
-      //        url: futureState.urlFragment,
-      //        template: '<h3>Future State Template</h3>',
-      //        controller: function() {
-      //          console.log("Entered state " + futureState.stateName);
-      //        }
-      //      }
-      //    });
-      this.stateFactory = function (futureStateType, factory) {
-        stateFactories[futureStateType] = factory;
-      };
-
-      this.futureState = function (futureState) {
-        if (futureState.stateName)  // backwards compat for now
-          futureState.name = futureState.stateName;
-        if (futureState.urlPrefix)  // backwards compat for now
-          futureState.url = "^" + futureState.urlPrefix;
-
-        futureStates[futureState.name] = futureState;
-        var parentMatcher,  parentName = futureState.name.split(/\./).slice(0, -1).join("."),
-          realParent = findState(futureState.parent || parentName);
-        if (realParent) {
-          parentMatcher = realParent.url || realParent.navigable.url;
-        } else if (parentName === "") {
-          parentMatcher = $urlMatcherFactory.compile("");
-        } else {
-          var futureParent = findState((futureState.parent || parentName), true);
-          if (!futureParent) throw new Error("Couldn't determine parent state of future state. FutureState:" + angular.toJson(futureState));
-          var pattern = futureParent.urlMatcher.source.replace(/\*rest$/, "");
-          parentMatcher = $urlMatcherFactory.compile(pattern);
-          futureState.parentFutureState = futureParent;
-        }
+      futureStates[futureState.name] = futureState;
+      var parentMatcher,  parentName = futureState.name.split(/\./).slice(0, -1).join("."),
+        realParent = findState(futureState.parent || parentName);
+      if (realParent) {
+        parentMatcher = realParent.url || realParent.navigable.url;
+      } else if (parentName === "") {
+        parentMatcher = $urlMatcherFactory.compile("");
+      } else {
+        var futureParent = findState((futureState.parent || parentName), true);
+        if (!futureParent) throw new Error("Couldn't determine parent state of future state. FutureState:" + angular.toJson(futureState));
+        var pattern = futureParent.urlMatcher.source.replace(/\*rest$/, "");
+        parentMatcher = $urlMatcherFactory.compile(pattern);
+        futureState.parentFutureState = futureParent;
+      }
+      if (futureState.url) {
         futureState.urlMatcher = futureState.url.charAt(0) === "^" ?
           $urlMatcherFactory.compile(futureState.url.substring(1) + "*rest") :
           parentMatcher.concat(futureState.url + "*rest");
-      };
-
-      this.get = function () {
-        return angular.extend({}, futureStates);
-      };
-
-      function findState(stateOrName, findFutureState) {
-        var statename = angular.isObject(stateOrName) ? stateOrName.name : stateOrName;
-        return !findFutureState ? internalStates[statename] : futureStates[statename];
       }
+    };
 
-      /* options is an object with at least a name or url attribute */
-      function findFutureState($state, options) {
-        if (options.name) {
-          var nameComponents = options.name.split(/\./);
-          if (options.name.charAt(0) === '.')
-            nameComponents[0] = $state.current.name;
-          while (nameComponents.length) {
-            var stateName = nameComponents.join(".");
-            if ($state.get(stateName, { relative: $state.current }))
-              return null; // State is already defined; nothing to do
-            if (futureStates[stateName])
-              return futureStates[stateName];
-            nameComponents.pop();
-          }
-        }
+    this.get = function () {
+      return angular.extend({}, futureStates);
+    };
 
-        if (options.url) {
-          var matches = [];
-          for(var future in futureStates) {
-            if (futureStates[future].urlMatcher.exec(options.url)) {
-              matches.push(futureStates[future]);
-            }
-          }
-          // Find most specific by ignoring matching parents from matches
-          var copy = matches.slice(0);
-          for (var i = matches.length - 1; i >= 0; i--) {
-            for (var j = 0; j < copy.length; j++) {
-              if (matches[i] === copy[j].parentFutureState) matches.splice(i, 1);
-            }
-          }
-          return matches[0];
+    function findState(stateOrName, findFutureState) {
+      var statename = angular.isObject(stateOrName) ? stateOrName.name : stateOrName;
+      return !findFutureState ? internalStates[statename] : futureStates[statename];
+    }
+
+    /* options is an object with at least a name or url attribute */
+    function findFutureState($state, options) {
+      if (options.name) {
+        var nameComponents = options.name.split(/\./);
+        if (options.name.charAt(0) === '.')
+          nameComponents[0] = $state.current.name;
+        while (nameComponents.length) {
+          var stateName = nameComponents.join(".");
+          if ($state.get(stateName, { relative: $state.current }))
+            return null; // State is already defined; nothing to do
+          if (futureStates[stateName])
+            return futureStates[stateName];
+          nameComponents.pop();
         }
       }
 
-      function lazyLoadState($injector, futureState) {
-        lazyloadInProgress = true;
-        var $q = $injector.get("$q");
-        if (!futureState) {
-          var deferred = $q.defer();
-          deferred.reject("No lazyState passed in " + futureState);
-          return deferred.promise;
+      if (options.url) {
+        var matches = [];
+        for(var future in futureStates) {
+          var matcher = futureStates[future].urlMatcher;
+          if (matcher && matcher.exec(options.url)) {
+            matches.push(futureStates[future]);
+          }
         }
-
-        var promise = $q.when([]), parentFuture = futureState.parentFutureState;
-        if (parentFuture && futureStates[parentFuture.name]) {
-          promise = lazyLoadState($injector, futureStates[parentFuture.name]);
+        // Find most specific by ignoring matching parents from matches
+        var copy = matches.slice(0);
+        for (var i = matches.length - 1; i >= 0; i--) {
+          for (var j = 0; j < copy.length; j++) {
+            if (matches[i] === copy[j].parentFutureState) matches.splice(i, 1);
+          }
         }
+        return matches[0];
+      }
+    }
 
-        var type = futureState.type;
-        var factory = stateFactories[type];
-        if (!factory) throw Error("No state factory for futureState.type: " + (futureState && futureState.type));
-        return promise
-          .then(function(array) {
-            var injectorPromise = $injector.invoke(factory, factory, { futureState: futureState });
-            return injectorPromise.then(function(fullState) {
-              if (fullState) { array.push(fullState); } // Pass a chain of realized states back
-              return array;
-            });
-          })
-          ["finally"](function() { // IE8 hack
-            delete(futureStates[futureState.name]);
+    function lazyLoadState($injector, futureState) {
+      lazyloadInProgress = true;
+      var $q = $injector.get("$q");
+      if (!futureState) {
+        var deferred = $q.defer();
+        deferred.reject("No lazyState passed in " + futureState);
+        return deferred.promise;
+      }
+
+      var promise = $q.when([]), parentFuture = futureState.parentFutureState;
+      if (parentFuture && futureStates[parentFuture.name]) {
+        promise = lazyLoadState($injector, futureStates[parentFuture.name]);
+      }
+
+      var type = futureState.type;
+      var factory = stateFactories[type];
+      if (!factory) throw Error("No state factory for futureState.type: " + (futureState && futureState.type));
+      return promise
+        .then(function(array) {
+          var injectorPromise = $injector.invoke(factory, factory, { futureState: futureState });
+          return injectorPromise.then(function(fullState) {
+            if (fullState) { array.push(fullState); } // Pass a chain of realized states back
+            return array;
           });
-      }
+        })
+        ["finally"](function() { // IE8 hack
+        delete(futureStates[futureState.name]);
+      });
+    }
 
-      var otherwiseFunc = [ '$log', '$location',
-        function otherwiseFunc($log, $location) {
-          $log.debug("Unable to map " + $location.path());
-        }];
+    var otherwiseFunc = [ '$log', '$location',
+      function otherwiseFunc($log, $location) {
+        $log.debug("Unable to map " + $location.path());
+      }];
 
-      function futureState_otherwise($injector, $location) {
-        var resyncing = false;
+    function futureState_otherwise($injector, $location) {
+      var resyncing = false;
 
-        var lazyLoadMissingState =
-          ['$rootScope', '$urlRouter', '$state',
-            function lazyLoadMissingState($rootScope, $urlRouter, $state) {
-              if (!initDone) {
-                // Asynchronously load state definitions, then resync URL
-                initPromise().then(function initialResync() {
-                  resyncing = true;
-                  $urlRouter.sync();
-                  resyncing = false;
-                });
-                initDone = true;
-                return;
-              }
-
-              var futureState = findFutureState($state, { url: $location.path() });
-              if (!futureState) {
-                return $injector.invoke(otherwiseFunc);
-              }
-
-              // Config loaded.  Asynchronously lazy-load state definition from URL fragment, if mapped.
-              lazyLoadState($injector, futureState).then(function lazyLoadedStateCallback(states) {
-                states.forEach(function (state) {
-                  if (state && (!$state.get(state) || (state.name && !$state.get(state.name))))
-                    $stateProvider.state(state);
-                });
-                lazyloadInProgress = false;
-                resyncing = true;
-                $urlRouter.sync();
-                resyncing = false;
-              }, function lazyLoadStateAborted() {
-                lazyloadInProgress = false;
-                return $injector.invoke(otherwiseFunc);
-              });
-            }];
-        if (lazyloadInProgress) return;
-
-        var nextFn = resyncing ? otherwiseFunc : lazyLoadMissingState;
-        return $injector.invoke(nextFn);
-      }
-
-      $urlRouterProvider.otherwise(futureState_otherwise);
-
-      $urlRouterProvider.otherwise = function(rule) {
-        if (angular.isString(rule)) {
-          var redirect = rule;
-          rule = function () { return redirect; };
-        }
-        else if (!angular.isFunction(rule)) throw new Error("'rule' must be a function");
-        otherwiseFunc = rule;
-        return $urlRouterProvider;
-      };
-
-      var serviceObject = {
-        getResolvePromise: function () {
-          return initPromise();
-        }
-      };
-
-      // Used in .run() block to init
-      this.$get = [ '$injector', '$state', '$q', '$rootScope', '$urlRouter', '$timeout', '$log',
-        function futureStateProvider_get($injector, $state, $q, $rootScope, $urlRouter, $timeout, $log) {
-          function init() {
-            $rootScope.$on("$stateNotFound", function futureState_notFound(event, unfoundState, fromState, fromParams) {
-              if (lazyloadInProgress) return;
-              $log.debug("event, unfoundState, fromState, fromParams", event, unfoundState, fromState, fromParams);
-
-              var futureState = findFutureState($state, { name: unfoundState.to });
-              if (!futureState) return;
-
-              event.preventDefault();
-              var promise = lazyLoadState($injector, futureState);
-              promise.then(function (states) {
-                states.forEach(function (state) {
-                  if (state && (!$state.get(state) || (state.name && !$state.get(state.name))))
-                    $stateProvider.state(state);
-                });
-                $state.go(unfoundState.to, unfoundState.toParams);
-                lazyloadInProgress = false;
-              }, function (error) {
-                console.log("failed to lazy load state ", error);
-                $state.go(fromState, fromParams);
-                lazyloadInProgress = false;
-              });
-            });
-
-            // Do this better.  Want to load remote config once, before everything else
-            if (!initPromise) {
-              var promises = [];
-              angular.forEach(resolveFunctions, function (promiseFn) {
-                promises.push($injector.invoke(promiseFn));
-              });
-              initPromise = function () {
-                return $q.all(promises);
-              };
-//          initPromise = _.once(function flattenFutureStates() {
-//            var allPromises = $q.all(promises);
-//            return allPromises.then(function(data) {
-//              return _.flatten(data);
-//            });
-//          });
+      var lazyLoadMissingState =
+        ['$rootScope', '$urlRouter', '$state',
+          function lazyLoadMissingState($rootScope, $urlRouter, $state) {
+            function resync() {
+              resyncing = true; $urlRouter.sync(); resyncing = false;
+            }
+            if (!initDone) {
+              // Asynchronously load state definitions, then resync URL
+              initPromise().then(resync);
+              initDone = true;
+              return;
             }
 
-            // TODO: analyze this. I'm calling $urlRouter.sync() in two places for retry-initial-transition.
-            // TODO: I should only need to do this once.  Pick the better place and remove the extra resync.
-            initPromise().then(function retryInitialState() {
-              $timeout(function () {
-                if ($state.transition) {
-                  $state.transition.then($urlRouter.sync, $urlRouter.sync);
-                } else {
-                  $urlRouter.sync();
-                }
+            var futureState = findFutureState($state, { url: $location.path() });
+            if (!futureState) {
+              return $injector.invoke(otherwiseFunc);
+            }
+
+            // Config loaded.  Asynchronously lazy-load state definition from URL fragment, if mapped.
+            lazyLoadState($injector, futureState).then(function lazyLoadedStateCallback(states) {
+              states.forEach(function (state) {
+                if (state && (!$state.get(state) || (state.name && !$state.get(state.name))))
+                  $stateProvider.state(state);
               });
+              lazyloadInProgress = false;
+              resync();
+            }, function lazyLoadStateAborted() {
+              lazyloadInProgress = false;
+              resync();
             });
+          }];
+      if (lazyloadInProgress) return;
+
+      var nextFn = resyncing ? otherwiseFunc : lazyLoadMissingState;
+      return $injector.invoke(nextFn);
+    }
+
+    $urlRouterProvider.otherwise(futureState_otherwise);
+
+    $urlRouterProvider.otherwise = function(rule) {
+      if (angular.isString(rule)) {
+        var redirect = rule;
+        rule = function () { return redirect; };
+      }
+      else if (!angular.isFunction(rule)) throw new Error("'rule' must be a function");
+      otherwiseFunc = ['$injector', '$location', rule];
+      return $urlRouterProvider;
+    };
+
+    var serviceObject = {
+      getResolvePromise: function () {
+        return initPromise();
+      }
+    };
+
+    // Used in .run() block to init
+    this.$get = [ '$injector', '$state', '$q', '$rootScope', '$urlRouter', '$timeout', '$log',
+      function futureStateProvider_get($injector, $state, $q, $rootScope, $urlRouter, $timeout, $log) {
+        function init() {
+          $rootScope.$on("$stateNotFound", function futureState_notFound(event, unfoundState, fromState, fromParams) {
+            if (lazyloadInProgress) return;
+            $log.debug("event, unfoundState, fromState, fromParams", event, unfoundState, fromState, fromParams);
+
+            var futureState = findFutureState($state, { name: unfoundState.to });
+            if (!futureState) return;
+
+            event.preventDefault();
+            var promise = lazyLoadState($injector, futureState);
+            promise.then(function (states) {
+              states.forEach(function (state) {
+                if (state && (!$state.get(state) || (state.name && !$state.get(state.name))))
+                  $stateProvider.state(state);
+              });
+              $state.go(unfoundState.to, unfoundState.toParams);
+              lazyloadInProgress = false;
+            }, function (error) {
+              console.log("failed to lazy load state ", error);
+              $state.go(fromState, fromParams);
+              lazyloadInProgress = false;
+            });
+          });
+
+          // Do this better.  Want to load remote config once, before everything else
+          if (!initPromise) {
+            var promises = [];
+            angular.forEach(resolveFunctions, function (promiseFn) {
+              promises.push($injector.invoke(promiseFn));
+            });
+            initPromise = function () {
+              return $q.all(promises);
+            };
           }
 
-          init();
+          // TODO: analyze this. I'm calling $urlRouter.sync() in two places for retry-initial-transition.
+          // TODO: I should only need to do this once.  Pick the better place and remove the extra resync.
+          initPromise().then(function retryInitialState() {
+            $timeout(function () {
+              if ($state.transition) {
+                $state.transition.then($urlRouter.sync, $urlRouter.sync);
+              } else {
+                $urlRouter.sync();
+              }
+            });
+          });
+        }
 
-          serviceObject.state = $stateProvider.state;
-          serviceObject.futureState = provider.futureState;
-          serviceObject.get = provider.get;
+        init();
 
-          return serviceObject;
-        }];
-    }]);
+        serviceObject.state = $stateProvider.state;
+        serviceObject.futureState = provider.futureState;
+        serviceObject.get = provider.get;
 
-angular.module('ct.ui.router.extras').run(['$futureState',
-  // Just inject $futureState so it gets initialized.
-  function ($futureState) {
+        return serviceObject;
+      }
+    ];
   }
-]);
 
-angular.module('ct.ui.router.extras').service("$previousState",
+  app.provider('$futureState', _futureStateProvider);
+
+  var statesAddedQueue = {
+    state: function(state) {
+      if (statesAddedQueue.$rootScope)
+        statesAddedQueue.$rootScope.$broadcast("$stateAdded", state);
+    },
+    itsNowRuntimeOhWhatAHappyDay: function($rootScope) {
+      statesAddedQueue.$rootScope = $rootScope;
+    },
+    $rootScope: undefined
+  };
+
+  app.config([ '$stateProvider', function($stateProvider) {
+    // decorate $stateProvider.state so we can broadcast when a real state was added
+    var realStateFn = $stateProvider.state;
+    $stateProvider.state = function state_announce() {
+      var val = realStateFn.apply($stateProvider, arguments);
+
+      var state = angular.isObject(arguments[0]) ? arguments[0] : arguments[1];
+      statesAddedQueue.state(state);
+      return val;
+    };
+  }]);
+
+  // inject $futureState so the service gets initialized via $get();
+  app.run(['$futureState', function ($futureState, $rootScope) {
+    statesAddedQueue.itsNowRuntimeOhWhatAHappyDay($rootScope);
+  } ]);
+
+})(angular);
+
+angular.module('ct.ui.router.extras.previous', [ 'ct.ui.router.extras.core', 'ct.ui.router.extras.transition' ]).service("$previousState",
   [ '$rootScope', '$state',
     function ($rootScope, $state) {
-      var previous = null;
-      var memos = {};
+      var previous = null, lastPrevious = null, memos = {};
 
-      var lastPrevious = null;
+      $rootScope.$on("$transitionStart", function(evt, $transition$) {
+        var from = $transition$.from;
+        // Check if the fromState is navigable before tracking it.
+        // Root state doesn't get decorated with $$state().  Doh.
+        var fromState = from.state && from.state.$$state && from.state.$$state();
+        if (fromState && fromState.navigable) {
+          lastPrevious = previous;
+          previous = $transition$.from;
+        }
 
-      $rootScope.$on("$stateChangeStart", function (evt, toState, toStateParams, fromState, fromStateParams) {
-        // State change is starting.  Keep track of the CURRENT previous state in case we have to restore it
-        lastPrevious = previous;
-        previous = { state: fromState, params: fromStateParams };
-      });
-
-      $rootScope.$on("$stateChangeError", function () {
-        // State change did not occur due to an error.  Restore the previous previous state.
-        previous = lastPrevious;
-        lastPrevious = null;
-      });
-
-      $rootScope.$on("$stateChangeSuccess", function () {
-        lastPrevious = null;
+        $transition$.promise.then(commit).catch(revert);
+        function commit() { lastPrevious = null; }
+        function revert() { previous = lastPrevious; }
       });
 
       var $previousState = {
@@ -1354,7 +1507,11 @@ angular.module('ct.ui.router.extras').service("$previousState",
           memos[memoName] = previous || { state: $state.get(defaultStateName), params: defaultStateParams };
         },
         forget: function (memoName) {
-          delete memos[memoName];
+          if (memoName) {
+            delete memos[memoName];
+          } else {
+            previous = undefined;
+          }
         }
       };
 
@@ -1363,12 +1520,12 @@ angular.module('ct.ui.router.extras').service("$previousState",
   ]
 );
 
-angular.module('ct.ui.router.extras').run(['$previousState', function ($previousState) {
+angular.module('ct.ui.router.extras.previous').run(['$previousState', function ($previousState) {
   // Inject $previousState so it can register $rootScope events
 }]);
 
 
-angular.module("ct.ui.router.extras").config( [ "$provide",  function ($provide) {
+angular.module("ct.ui.router.extras.transition", [ 'ct.ui.router.extras.core' ]).config( [ "$provide",  function ($provide) {
       // Decorate the $state service, so we can replace $state.transitionTo()
       $provide.decorator("$state", ['$delegate', '$rootScope', '$q', '$injector',
         function ($state, $rootScope, $q, $injector) {
@@ -1409,7 +1566,8 @@ angular.module("ct.ui.router.extras").config( [ "$provide",  function ($provide)
             return function successFn(data) {
               popStack();
               $rootScope.$broadcast("$transitionSuccess", tSuccess);
-              return deferred.resolve(data);
+              deferred.resolve(data); // $transition$ deferred
+              return data;
             };
           }
 
@@ -1419,7 +1577,8 @@ angular.module("ct.ui.router.extras").config( [ "$provide",  function ($provide)
             return function failureFn(error) {
               popStack();
               $rootScope.$broadcast("$transitionError", tFail, error);
-              return deferred.reject(error);
+              deferred.reject(error);  // $transition$ deferred
+              return $q.reject(error);
             };
           }
 
@@ -1461,4 +1620,200 @@ angular.module("ct.ui.router.extras").config( [ "$provide",  function ($provide)
   ]
 );
 
-})(window, window.angular);
+// statevis requires d3.
+(function () {
+  "use strict";
+  var app = angular.module("ct.ui.router.extras.statevis", [ 'ct.ui.router.extras.core', 'ct.ui.router.extras.sticky'  ]);
+
+  app.directive('stateVis', [ '$state', '$timeout', '$interval', stateVisDirective ]);
+
+  /**
+   * This directive gets all the current states using $state.get() and displays them in a tree using D3 lib.
+   * It then listens for state events and updates the tree.
+   *
+   * Usage:
+   * <state-vis height="1000px" width="1000px"></state-vis>
+   */
+  function stateVisDirective($state, $timeout, $interval) {
+    return {
+      scope: {
+        width: '@',
+        height: '@'
+      },
+      restrict: 'AE',
+      template: '<svg></svg>',
+      link: function (_scope, _elem, _attrs) {
+        var stateMap = {};
+        var width = _scope.width || 400,
+          height = _scope.height || 400;
+
+        var tree = d3.layout.tree()
+            .size([width - 20, height - 20])
+            .separation(function (a, b) {
+              return a.parent == b.parent ? 10 : 25;
+            });
+
+        var root = $state.get().filter(function (state) { return state.name === ""; })[0];
+        var nodes = tree(root);
+
+        root.parent = root;
+        root.px = root.x = width / 2;
+        root.py = root.y = height / 2;
+
+        var activeNode = { };
+        activeNode.px = activeNode.x = root.px;
+        activeNode.py = activeNode.y = root.py;
+
+        var diagonal = d3.svg.diagonal();
+
+        var svg = d3.select(_elem.find("svg")[0])
+          .attr("width", width)
+          .attr("height", height)
+          .append("g")
+          .attr("transform", "translate(10, 10)");
+
+        var node = svg.selectAll(".node"),
+          link = svg.selectAll(".link"),
+          active = svg.selectAll(".active")
+          ;
+
+        var updateInterval = 200,
+          transLength = 200,
+          timer = setInterval(update, updateInterval);
+
+        function addStates(data) {
+          // *********** Convert flat data into a nice tree ***************
+          data = data.map(function (node) {
+            return node.name === "" ? root : angular.copy(node);
+          });
+          angular.extend(stateMap, data.reduce(function (map, node) {
+            map[node.name] = node;
+            return map;
+          }, {}));
+
+          data.forEach(function (node) {
+            // add to parent
+            var parentName = node.name.split(/\./).slice(0, -1).join(".");
+            var parent = node.name != parentName && stateMap[parentName];
+            if (parent) {
+              (parent.children || (parent.children = [])).push(node); // create child array if it doesn't exist
+              node.px = parent.px;
+              node.py = parent.py;
+              nodes.push(node);
+            }
+          });
+        }
+
+        $interval(function () {
+          _scope.states = $state.get();
+          angular.forEach(nodes, function (n) {
+            var s = $state.get(n.name);
+            if (s) {
+              n.status = s.status || 'exited';
+            }
+          });
+//          _scope.futureStates = $futureState.get();
+        }, 250);
+
+        _scope.$watchCollection("states", function (newval, oldval) {
+          var oldstates = (oldval || []).map(function (s) { return s.name; });
+          addStates((newval || []).filter(function(state) { return oldstates.indexOf(state.name) == -1; } ));
+//          addStates(_.reject(newval, function (state) { return _.contains(oldstates, state.name); }));
+        });
+
+//        addStates($state.get());
+        update(updateInterval);
+
+        function update() {
+          // Recompute the layout and data join.
+          node = node.data(tree.nodes(root), function (d) { return d.name; });
+          link = link.data(tree.links(nodes), function (d) { return d.target.name; });
+          active = active.data(activeNode);
+
+          nodes.forEach(function (d) { d.y = d.depth * 70; });
+
+          // Add entering nodes in the parent’s old position.
+          var nodeEnter = node.enter();
+
+          function stateName(node) {
+            var name = node.name.split(".").pop();
+            if (node.sticky) { name += " (STICKY)"; }
+            if (node.deepStateRedirect) { name += " (DSR)"; }
+            return name;
+          }
+
+          active.enter()
+            .append("circle")
+            .attr("class", "active")
+            .attr("r", 13)
+            .attr("cx", function (d) { return d.parent.px || 100; })
+            .attr("cy", function (d) { return d.parent.py || 100; })
+          ;
+
+          nodeEnter.append("circle")
+            .attr("class", "node")
+            .attr("r", 9)
+            .attr("cx", function (d) { return d.parent.px; })
+            .attr("cy", function (d) { return d.parent.py; });
+
+          nodeEnter.append("text")
+            .attr("class", "label")
+            .attr("x", function (d) { return d.parent.px; })
+            .attr("y", function (d) { return d.parent.py; })
+            .attr("text-anchor", function (d) { return "middle"; })
+            .text(stateName)
+            .style("fill-opacity", 1);
+
+
+          // Add entering links in the parent’s old position.
+          link.enter().insert("path", ".node")
+            .attr("class", "link")
+            .attr("d", function (d) {
+              var o = {x: d.source.px, y: d.source.py};
+              return diagonal({source: o, target: o});
+            });
+
+          // Transition nodes and links to their new positions.
+          var t = svg.transition()
+            .duration(transLength);
+
+          t.selectAll(".link")
+            .attr("d", diagonal);
+
+          /* jshint -W093 */
+          var circleColors = { entered: '#AF0', exited: '#777', active: '#0f0', inactive: '#55F', future: '#009' };
+          t.selectAll(".node")
+            .attr("cx", function (d) { return d.px = d.x; })
+            .attr("cy", function (d) { return d.py = d.y; })
+            .attr("r", function (d) { return d.status === 'active' ? 15 : 10; })
+            .style("fill", function (d) { return circleColors[d.status] || "#FFF"; });
+
+          t.selectAll(".label")
+            .attr("x", function (d) { return d.px = d.x; })
+            .attr("y", function (d) { return d.py = d.y - 15; })
+            .attr("transform", function (d) { return "rotate(-25 " + d.x + " " + d.y + ")"; })
+          ;
+
+          t.selectAll(".active")
+            .attr("x", function (d) { return d.px = d.x; })
+            .attr("y", function (d) { return d.py = d.y - 15; });
+        }
+      }
+    };
+  }
+})();
+
+
+angular.module("ct.ui.router.extras",
+  [
+    'ct.ui.router.extras.core',
+    'ct.ui.router.extras.dsr',
+    'ct.ui.router.extras.future',
+    'ct.ui.router.extras.previous',
+    'ct.ui.router.extras.statevis',
+    'ct.ui.router.extras.sticky',
+    'ct.ui.router.extras.transition'
+  ]);
+
+
+})(angular);
