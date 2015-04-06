@@ -2,7 +2,7 @@
 
 var myApp = angular.module('myApp', ['ui.router', 'ct.ui.router.extras']);
 
-myApp.config(function ($stateProvider, $urlRouterProvider, $futureStateProvider, $locationProvider) {
+myApp.config(function ($stateProvider, $urlRouterProvider, $futureStateProvider, $locationProvider, $urlMatcherFactoryProvider) {
   var states = [
       {
         'stateName': 'root',
@@ -26,7 +26,7 @@ myApp.config(function ($stateProvider, $urlRouterProvider, $futureStateProvider,
         }
       },
       {
-        'stateName': 'root.about',
+        'stateName': 'about',
         'urlPrefix': '/about',
         'type': 'async',
         'views': {
@@ -46,7 +46,7 @@ myApp.config(function ($stateProvider, $urlRouterProvider, $futureStateProvider,
         }
       }
     ];
-
+  $urlMatcherFactoryProvider.strictMode(false);
   $locationProvider.html5Mode({
     enabled: true,
     requireBase: false
